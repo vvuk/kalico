@@ -26,7 +26,6 @@ from typing import (
 )
 
 try:
-
     HAS_PLOTLY = True
 except:
     HAS_PLOTLY = False
@@ -369,6 +368,10 @@ class ProbeEddyProbeResult:
     errors: int = 0
 
     USE_MEAN_FOR_VALUE: ClassVar[bool] = False
+
+    @property
+    def valid(self):
+        return len(self.samples) > 0
 
     @property
     def value(self):
@@ -1205,6 +1208,48 @@ class ProbeEddy:
         )
         return status
 
+    # Old Probe interface, for Kalico
+
+    def get_lift_speed(self, gcmd=None):
+        if gcmd is not None:
+            return gcmd.get_float(
+                "LIFT_SPEED", self.params.lift_speed, above=0.0
+            )
+        return self.params.lift_speed
+
+    def multi_probe_begin(self):
+        pass
+
+    def multi_probe_end(self):
+        pass
+
+    # This is a mishmash of cmd_PROBE and cmd_PROBE_STATIC. This run_probe
+    # is the old one, different than the scanning session run_probe.
+    def run_probe(self, gcmd=None):
+        z = self.params.home_trigger_height
+        duration = 0.100
+
+        if not self._z_homed():
+            raise self._printer.command_error("Must home Z before PROBE")
+
+        th = self._printer.lookup_object("toolhead")
+        th_pos = th.get_position()
+        if th_pos[2] < z:
+            th.manual_move([None, None, z + 3.0], self.params.lift_speed)
+        th.manual_move([None, None, z], self.params.lift_speed)
+        th.dwell(0.100)
+        th.wait_moves()
+
+        if not self.calibrated():
+            raise self._printer.command_error("Eddy probe not calibrated!")
+
+        r = self.probe_static_height(duration)
+        if not r.valid:
+            raise self._printer.command_error("Probe captured no samples!")
+
+        # is this supposed to return xyze or xyz?
+        return [th_pos[0], th_pos[1], r.value, th_pos[3]]
+
     #
     # Moving the sensor to the correct position
     #
@@ -1333,7 +1378,7 @@ class ProbeEddy:
         # to compensate for backlash
         if th_pos[2] < start_z:
             logging.info(
-                f"EDDYng probe_to_start_position: moving toolhead from {th_pos[2]:.3f} to {(start_z+1.0):.3f}"
+                f"EDDYng probe_to_start_position: moving toolhead from {th_pos[2]:.3f} to {(start_z + 1.0):.3f}"
             )
             th_pos[2] = start_z + 1.0
             th.manual_move(th_pos, self.params.lift_speed)
