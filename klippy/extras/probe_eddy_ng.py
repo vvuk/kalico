@@ -803,7 +803,7 @@ class ProbeEddy:
                     [(s - result.value) ** 2.0 for s in result.samples]
                 )
 
-                gcmd.respond_info("Probe at z={pz:.3f} is {result:v}")
+                gcmd.respond_info(f"Probe at z={pz:.3f} is {result:v}")
 
                 stddev_sums.append(stddev_sum)
                 stddev_count += len(result.samples)
@@ -816,7 +816,7 @@ class ProbeEddy:
                 avg_from_z = np.mean(from_zs)
                 stddev = (np.sum(stddev_sums) / stddev_count) ** 0.5
                 gcmd.respond_info(
-                    "Probe overall avg range: {avg_range:.3f}, avg z deviation: {avg_from_z:.3f}, stddev: {stddev:.3f}"
+                    f"Probe overall avg range: {avg_range:.3f}, avg z deviation: {avg_from_z:.3f}, stddev: {stddev:.3f}"
                 )
 
         finally:
