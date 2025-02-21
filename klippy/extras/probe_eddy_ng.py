@@ -238,8 +238,8 @@ class ProbeEddyParams:
     write_tap_plot: bool = True
     # whether to write the tap plot for every tap
     write_every_tap_plot: bool = False
-    # whether to be very verbose with logs
-    debug: bool = False
+    # maximum number of errors to allow in a row on the sensor
+    max_errors: int = 0
 
     tap_trigger_safe_start_height: float = 1.5
 
@@ -298,6 +298,7 @@ class ProbeEddyParams:
             "tap_drive_current", 0, minval=0, maxval=31
         )
 
+        logging.info(f"saved {saved_reg_drive_current} reg {reg_drive_current}")
         if (
             saved_reg_drive_current != 0
             and reg_drive_current != 0
@@ -324,6 +325,7 @@ class ProbeEddyParams:
         if tap_drive_current == 0:
             tap_drive_current = saved_tap_drive_current
 
+        logging.info(f"saved reg {reg_drive_current} set")
         self.reg_drive_current = reg_drive_current
         self.tap_drive_current = tap_drive_current
 
@@ -378,18 +380,16 @@ class ProbeEddyParams:
         if self.tap_trigger_safe_start_height == -1.0:  # sentinel
             self.tap_trigger_safe_start_height = self.home_trigger_height / 2.0
 
-        self.allow_unsafe = config.getboolean("allow_unsafe", self.allow_unsafe)
-        self.write_tap_plot = config.getboolean(
-            "write_tap_plot", self.write_tap_plot
-        )
+        self.allow_unsafe = config.getboolean("allow_unsafe", False)
+        self.write_tap_plot = config.getboolean("write_tap_plot", True)
         self.write_every_tap_plot = config.getboolean(
-            "write_every_tap_plot", self.write_every_tap_plot
+            "write_every_tap_plot", True
         )
+
+        self.max_errors = config.getint("max_errors", self.max_errors)
 
         self.x_offset = config.getfloat("x_offset", self.x_offset)
         self.y_offset = config.getfloat("y_offset", self.y_offset)
-
-        self.debug = config.getboolean("debug", self.debug)
 
         self.validate(config)
 
@@ -468,6 +468,8 @@ class ProbeEddyProbeResult:
 @final
 class ProbeEddy:
     def __init__(self, config: ConfigWrapper):
+        logging.info("Hello from ProbeEddyNG")
+
         self._printer: Printer = config.get_printer()
         self._gcode = self._printer.lookup_object("gcode")
         self._full_name = config.get_name()
@@ -489,6 +491,7 @@ class ProbeEddy:
         self.params = ProbeEddyParams()
         self.params.load_from_config(config)
         if self.params.reg_drive_current == 0:
+            logging.info(f" is zero, overriding {self._sensor._drive_current}")
             # set as default
             self.params.reg_drive_current = self._sensor._drive_current
 
@@ -586,10 +589,6 @@ class ProbeEddy:
 
     def _log_trace(self, msg):
         logging.debug(f"{self._name}: {msg}")
-
-    def _log_debug(self, msg):
-        if self.params.debug:
-            logging.debug(f"{self._name}: {msg}")
 
     def define_commands(self, gcode):
         gcode.register_command(
@@ -841,21 +840,22 @@ class ProbeEddy:
                 samples = sampler.get_samples()
                 raw_samples = sampler.get_raw_samples()
                 data_file.write(
-                    "time,frequency,z,kin_z,raw_f,trigger_time,tap_end_time\n"
+                    "time,frequency,z,kin_z,kin_v,raw_f,trigger_time,tap_end_time\n"
                 )
                 for i in range(len(samples)):
                     trigger_time = kwargs.get("trigger_time", "")
                     tap_end_time = kwargs.get("tap_end_time", "")
                     s_t, s_freq, s_z = samples[i]
                     _, raw_f, _ = raw_samples[i]
-                    past_pos = get_toolhead_kin_pos(self._printer, at=s_t)
+                    past_pos, past_v = get_toolhead_kin_pos(self._printer, s_t)
                     past_k_z = past_pos[2] if past_pos is not None else None
-                    if past_k_z is None:
+                    if past_k_z is None or past_v is None:
                         past_k_z = ""
+                        past_v = ""
                     data_file.write(
-                        f"{s_t},{s_freq},{s_z},{past_k_z},{raw_f},{tap_end_time},{trigger_time}\n"
+                        f"{s_t},{s_freq},{s_z},{past_k_z},{past_v},{raw_f},{tap_end_time},{trigger_time}\n"
                     )
-            self._log_trace(
+            logging.info(
                 f"Wrote {len(samples)} samples to {self.save_samples_path}"
             )
             self.save_samples_path = None
@@ -1303,7 +1303,7 @@ class ProbeEddy:
 
     cmd_CALIBRATE_help = (
         "Calibrate the eddy current sensor. Specify DRIVE_CURRENT to calibrate for a different drive current "
-        + "than the default. Specify Z_MAX to set a different calibration start point."
+        + "than the default. Specify START_Z to set a different calibration start point."
     )
 
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
@@ -1343,9 +1343,9 @@ class ProbeEddy:
             "DRIVE_CURRENT", old_drive_current, minval=0, maxval=31
         )
         cal_z_max: float = gcmd.get_float(
-            "Z_MAX", self.params.calibration_z_max, above=2.0
+            "START_Z", self.params.calibration_z_max, above=2.0
         )
-        z_target: float = gcmd.get_float("Z_TARGET", 0.0)
+        z_target: float = gcmd.get_float("TARGET_Z", 0.0)
 
         probe_speed: float = gcmd.get_float(
             "SPEED", self.params.probe_speed, above=0.0
@@ -1363,7 +1363,7 @@ class ProbeEddy:
 
         th.wait_moves()
 
-        self._log_trace(f"EDDYng calibrating from {kin_pos}, {th_pos}")
+        logging.info(f"EDDYng calibrating from {kin_pos}, {th_pos}")
 
         # lift up above cal_z_max, and then move over so the probe
         # is over the nozzle position
@@ -1473,7 +1473,7 @@ class ProbeEddy:
         times = []
 
         for s_t, s_freq, _ in samples:
-            s_pos = get_toolhead_kin_pos(self._printer, at=s_t)
+            s_pos, _ = get_toolhead_kin_pos(self._printer, at=s_t)
             s_z = s_pos[2]
             if first_sample_time < s_t < last_sample_time and s_z >= z_target:
                 times.append(s_t)
@@ -1487,9 +1487,9 @@ class ProbeEddy:
             "DRIVE_CURRENT", self.params.reg_drive_current, minval=1, maxval=31
         )
         z_start: float = gcmd.get_float(
-            "Z_MAX", self.params.calibration_z_max, above=2.0
+            "START_Z", self.params.calibration_z_max, above=2.0
         )
-        z_end: float = gcmd.get_float("Z_TARGET", 0.0)
+        z_end: float = gcmd.get_float("TARGET_Z", 0.0)
         self._log_info(f"Testing Z={z_start:.3f} to Z={z_end:.3f}")
 
         mapping, fth, htf = self._create_mapping(
@@ -1604,7 +1604,7 @@ class ProbeEddy:
     #
     # Moving the sensor to the correct position
     #
-    def _probe_to_start_position_unhomed(self):
+    def _probe_to_start_position_unhomed(self, move_home=False):
         if not self._xy_homed():
             raise self._printer.command_error("xy must be homed")
         if not self.sampler_is_active():
@@ -1614,14 +1614,14 @@ class ProbeEddy:
         if not self.calibrated():
             raise self._printer.command_error("EDDYng not calibrated!")
 
-        th = self._toolhead
+        th = self._printer.lookup_object("toolhead")
         th_pos = th.get_position()
 
         # debug logging
         th_kin = th.get_kinematics()
         zlim = th_kin.limits[2]
         rail_range = th_kin.rails[2].get_range()
-        self._log_debug(
+        logging.info(
             f"EDDYng probe to start unhomed: before movement: Z pos {th_pos[2]:.3f}, "
             f"Z limits {zlim[0]:.2f}-{zlim[1]:.2f}, "
             f"rail range {rail_range[0]:.2f}-{rail_range[1]:.2f}"
@@ -1642,12 +1642,13 @@ class ProbeEddy:
                 "indicates a bad reg_drive_current."
             )
 
-        self._log_debug(
+        logging.info(
             f"EDDYng probe_to_start_position_unhomed: now: {now_height} (start {start_height})"
         )
         if abs(now_height - start_height) <= start_height_ok_factor:
             return
 
+        th = self._printer.lookup_object("toolhead")
         th_pos = th.get_position()
 
         MOVE_DOWN = False
@@ -1950,7 +1951,6 @@ class ProbeEddy:
         samples_stddev = gcmd.get_float(
             "SAMPLES_STDDEV", self.params.tap_samples_stddev, above=0.0
         )
-        home_z: bool = gcmd.get_int("HOME_Z", 0) == 1
 
         mode = gcmd.get("MODE", self.params.tap_mode).lower()
         if mode not in ("wma", "butter"):
@@ -2109,24 +2109,14 @@ class ProbeEddy:
             self._log_error(err_msg)
             raise self._printer.command_error("Tap failed")
 
-        th = self._printer.lookup_object("toolhead")
-
         # Adjust the computed tap_z by the user's tap_adjust_z, typically to raise
         # it to account for flex in the system (otherwise the Z would be too low)
         adjusted_tap_z = tap_z + tap_adjust_z
 
-        if home_z:
-            # tap by homing Z to 0.0 at adjusted tap z
-            th_pos = th.get_position()
-            overshoot = tap_z - th_pos[2]
-            th_pos[2] = -(overshoot + tap_adjust_z)
-            self._set_toolhead_position(th_pos, [2])
-        else:
-            # Don't home Z, but instead set gcode Z offset
-            gcode_move = self._printer.lookup_object("gcode_move")
-            gcode_delta = adjusted_tap_z - gcode_move.homing_position[2]
-            gcode_move.base_position[2] += gcode_delta
-            gcode_move.homing_position[2] = adjusted_tap_z
+        gcode_move = self._printer.lookup_object("gcode_move")
+        gcode_delta = adjusted_tap_z - gcode_move.homing_position[2]
+        gcode_move.base_position[2] += gcode_delta
+        gcode_move.homing_position[2] = adjusted_tap_z
 
         #
         # Figure out the offset to apply to sensor readings at the home trigger height
@@ -2146,6 +2136,7 @@ class ProbeEddy:
         # tap_z computed above. This does mean that the actual physical height probing happens at
         # is not likely to be exactly the same as the Z position, but all we care about is
         # variance from that position so this should be fine.
+        th = self._printer.lookup_object("toolhead")
         th.manual_move(
             [None, None, self.params.home_trigger_height + 1.0], lift_speed
         )
@@ -2228,7 +2219,7 @@ class ProbeEddy:
         s_true_f = np.asarray([s[1] for s in samples])
         s_z = np.asarray([s[2] for s in samples])
         s_kinz = np.asarray(
-            [get_toolhead_kin_pos(self._printer, s[0])[2] for s in samples]
+            [get_toolhead_kin_pos(self._printer, s[0])[0][2] for s in samples]
         )
 
         time_start = s_t.min()
@@ -2526,7 +2517,13 @@ class ProbeEddyScanningProbe:
         self._sampler = None
 
     def _lookup_toolhead_pos(self, time):
-        return get_toolhead_kin_pos(self._printer, time)
+        pos, _ = get_toolhead_kin_pos(self._printer, time)
+        return pos
+
+        # kin_spos = {s.get_name(): s.mcu_to_commanded_position(
+        #                              s.get_past_mcu_position(time))
+        #            for s in self._toolhead_kin.get_steppers()}
+        # return self._toolhead_kin.calc_position(kin_spos)
 
     def _rapid_lookahead_cb(self, time):
         start_time = time - self._sample_time / 2
@@ -2541,6 +2538,8 @@ class ProbeEddyScanningProbe:
 
         th = self._toolhead
 
+        # not sure I need this wait_moves, need to understand what position
+        # get_position returns
         th.dwell(self._sample_time_delay)
         th.wait_moves()
 
@@ -2601,6 +2600,7 @@ class ProbeEddyScanningProbe:
             # what callers want to know is "what Z would the toolhead be at, if it was at the height
             # the probe would 'trigger'", because this is all done in terms of klicky-type probes
             th_pos[2] = float(self._scan_z + z_deviation)
+            # toolhead_pos[2] = height
 
             results.append([th_pos[0], th_pos[1], th_pos[2]])
 
@@ -2701,7 +2701,7 @@ class ProbeEddyEndstopWrapper:
         # if we're doing a tap, we're already in the right position;
         # otherwise move there
         if self.tap_config is None:
-            self.eddy._probe_to_start_position_unhomed()
+            self.eddy._probe_to_start_position_unhomed(move_home=True)
 
     def _handle_homing_move_end(self, hmove):
         if self not in hmove.get_mcu_endstops():
@@ -2789,7 +2789,7 @@ class ProbeEddyEndstopWrapper:
             if self.tap_config.mode == "butter":
                 sos = self.tap_config.sos
                 for i in range(len(sos)):
-                    self.eddy._log_debug(f"EDDYng sos[{i}]: {sos[i]}")
+                    logging.info(f"EDDYng sos[{i}]: {sos[i]}")
                     self.eddy._sensor.set_sos_section(i, sos[i])
                 mode = "sos"
             elif self.tap_config.mode == "wma":
@@ -2803,7 +2803,7 @@ class ProbeEddyEndstopWrapper:
             mode = "home"
             tap_threshold = None
 
-        self.eddy._log_debug(
+        logging.info(
             f"EDDYng home_start {mode}: {print_time:.3f} freq: {trigger_freq:.2f} safe-start: {safe_freq:.2f} @ {safe_time:.3f}"
         )
         # setup homing -- will start scanning and trigger when we hit
@@ -2817,12 +2817,14 @@ class ProbeEddyEndstopWrapper:
             safe_time,
             mode=mode,
             tap_threshold=tap_threshold,
+            max_errors=self.eddy.params.max_errors,
         )
 
         return trigger_completion
 
     def home_wait(self, home_end_time):
-        self.eddy._log_debug(f"EDDYng home_wait until {home_end_time:.3f}")
+        logging.info(f"EDDYng home_wait until {home_end_time:.3f}")
+        # logging.info(f"EDDYng home_wait {home_end_time} cur {curtime} ept {est_print_time} ehe {est_he_time}")
         self._dispatch.wait_end(home_end_time)
 
         # make sure homing is stopped, and grab the trigger_time from the mcu
@@ -2835,7 +2837,7 @@ class ProbeEddyEndstopWrapper:
             self._sampler.memo("tap_end_time", tap_end_time)
             self._sampler.memo("tap_threshold", self.tap_config.threshold)
 
-        self.eddy._log_debug(
+        logging.info(
             f"EDDYng trigger_time {trigger_time} (mcu: {self._mcu.print_time_to_clock(trigger_time)}) tap_end_time: {tap_end_time}"
         )
 
@@ -2900,7 +2902,12 @@ class ProbeEddyEndstopWrapper:
 # Helper to gather samples and convert them to probe positions
 @final
 class ProbeEddySampler:
-    def __init__(self, eddy: ProbeEddy, calculate_heights: bool = True):
+    def __init__(
+        self,
+        eddy: ProbeEddy,
+        calculate_heights: bool = True,
+        trace: bool = False,
+    ):
         self.eddy = eddy
         self._sensor = eddy._sensor
         self._printer = self.eddy._printer
@@ -2909,6 +2916,7 @@ class ProbeEddySampler:
         self._stopped = False
         self._started = False
         self._errors = 0
+        self._trace = trace
         self._fmap = eddy.map_for_drive_current() if calculate_heights else None
 
         # this will hold the raw samples coming in from the sensor,
@@ -3061,9 +3069,10 @@ class ProbeEddySampler:
             logging.info(msg)
             raise self._printer.command_error(msg)
 
-        self.eddy._log_debug(
-            f"EDDYng waiting for sample at {sample_print_time:.3f} (now: {wait_start_time:.3f}, max_wait_time: {max_wait_time:.3f})"
-        )
+        if self._trace:
+            logging.info(
+                f"EDDYng waiting for sample at {sample_print_time:.3f} (now: {wait_start_time:.3f}, max_wait_time: {max_wait_time:.3f})"
+            )
         while (
             len(self._raw_samples) == 0
             or self._raw_samples[-1][0] < sample_print_time
@@ -3076,6 +3085,8 @@ class ProbeEddySampler:
         return True
 
     # Wait for some samples to be collected, even if errors
+    # TODO: there's a minimum wait time -- we need to fill up the buffer before data is sent, and that
+    # depends on the data rate
     def wait_for_samples(
         self,
         max_wait_time=0.250,
@@ -3132,9 +3143,10 @@ class ProbeEddySampler:
                 "No samples at all, so none in time range"
             )
 
-        self.eddy._log_debug(
-            f"EDDYng find_height_at_time: {len(self._samples)} samples, time range {self._samples[0][0]:.3f} to {self._samples[-1][0]:.3f}"
-        )
+        if self._trace:
+            logging.info(
+                f"EDDYng find_height_at_time: {len(self._samples)} samples, time range {self._samples[0][0]:.3f} to {self._samples[-1][0]:.3f}"
+            )
 
         # find the first sample that is >= start_time
         start_idx = bisect.bisect_left(
@@ -3161,9 +3173,10 @@ class ProbeEddySampler:
         hmin, hmax = np.min(heights), np.max(heights)
         mean = np.mean(heights)
         median = np.median(heights)
-        self.eddy._log_debug(
-            f"EDDYng find_height_at_time: {len(heights)} samples, median: {median:.3f}, mean: {mean:.3f} (range {hmin:.3f}-{hmax:.3f})"
-        )
+        if self._trace:
+            logging.info(
+                f"EDDYng find_height_at_time: {len(heights)} samples, median: {median:.3f}, mean: {mean:.3f} (range {hmin:.3f}-{hmax:.3f})"
+            )
 
         return float(median)
 
@@ -3481,7 +3494,7 @@ def get_toolhead_kin_pos(printer, at=None):
             )
             for s in toolhead_kin.get_steppers()
         }
-    return toolhead_kin.calc_position(kin_spos)
+    return toolhead_kin.calc_position(kin_spos), 0
 
 
 def np_rolling_mean(data, window, center=True):
