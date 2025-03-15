@@ -858,13 +858,18 @@ class MCU:
         clock = params.get("clock")
         if clock is not None:
             self._shutdown_clock = self.clock32_to_clock64(clock)
+        d1, d2 = params.get("d1"), params.get("d2")
+        d1 = str.format("d1=0x%08x", d1) if d1 else None
+        d2 = str.format("d2=0x%08x", d2) if d2 else None
         self._shutdown_msg = msg = params["static_string_id"]
         if get_danger_options().log_shutdown_info:
             logging.info(
-                "MCU '%s' %s: %s\n%s\n%s",
+                "MCU '%s' %s: %s %s %s\n%s\n%s",
                 self._name,
                 params["#name"],
                 self._shutdown_msg,
+                d1,
+                d2,
                 self._clocksync.dump_debug(),
                 self._serial.dump_debug(),
             )
@@ -873,6 +878,9 @@ class MCU:
             prefix = "Previous MCU '%s' shutdown: " % (self._name,)
 
         append_msgs = []
+        if d1 is not None or d2 is not None:
+            append_msgs.append({"d1": d1, "d2": d2})
+
         if (
             msg.startswith("ADC out of range")
             or msg.startswith("Thermocouple reader fault")
