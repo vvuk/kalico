@@ -13,6 +13,7 @@
 #include "board/pgm.h" // READP
 #include "command.h" // shutdown
 #include "sched.h" // sched_check_periodic
+#include "compiler.h"
 #include "stepper.h" // stepper_event
 
 static struct timer periodic_timer, sentinel_timer, deleted_timer;
@@ -21,6 +22,7 @@ static struct {
     struct timer *timer_list, *last_insert;
     int8_t tasks_status, tasks_busy;
     uint8_t shutdown_status, shutdown_reason;
+    uint32_t shutdown_data1, shutdown_data2;
 } SchedStatus = {.timer_list = &periodic_timer, .last_insert = &periodic_timer};
 
 
@@ -90,8 +92,10 @@ sched_add_timer(struct timer *add)
     struct timer *tl = SchedStatus.timer_list;
     if (unlikely(timer_is_before(waketime, tl->waketime))) {
         // This timer is before all other scheduled timers
-        if (timer_is_before(waketime, timer_read_time()))
-            try_shutdown("Timer too close");
+        uint32_t now = timer_read_time();
+        if (timer_is_before(waketime, now))
+            try_shutdown_with_data("Timer too close", (uint32_t) add->func,
+                now-waketime);
         if (tl == &deleted_timer)
             add->next = deleted_timer.next;
         else
@@ -307,15 +311,20 @@ run_shutdown(int reason)
     SchedStatus.shutdown_status = 1;
     irq_enable();
 
-    sendf("shutdown clock=%u static_string_id=%hu", cur
-          , SchedStatus.shutdown_reason);
+    sendf("shutdown clock=%u static_string_id=%hu d1=%u d2=%u", cur
+          , SchedStatus.shutdown_reason
+          , SchedStatus.shutdown_data1
+          , SchedStatus.shutdown_data2);
 }
 
 // Report the last shutdown reason code
 void
 sched_report_shutdown(void)
 {
-    sendf("is_shutdown static_string_id=%hu", SchedStatus.shutdown_reason);
+    sendf("is_shutdown static_string_id=%hu d1=%u d2=%u"
+          , SchedStatus.shutdown_reason
+          , SchedStatus.shutdown_data1
+          , SchedStatus.shutdown_data2);
 }
 
 // Shutdown the machine if not already in the process of shutting down
@@ -324,6 +333,13 @@ sched_try_shutdown(uint_fast8_t reason)
 {
     if (!SchedStatus.shutdown_status)
         sched_shutdown(reason);
+}
+
+void __always_inline
+sched_try_shutdown_with_data(uint_fast8_t reason, uint32_t d1, uint32_t d2)
+{
+    if (!SchedStatus.shutdown_status)
+        sched_shutdown_with_data(reason, d1, d2);
 }
 
 static jmp_buf shutdown_jmp;
@@ -336,6 +352,13 @@ sched_shutdown(uint_fast8_t reason)
     longjmp(shutdown_jmp, reason);
 }
 
+void __always_inline
+sched_shutdown_with_data(uint_fast8_t reason, uint32_t d1, uint32_t d2)
+{
+    SchedStatus.shutdown_data1 = d1;
+    SchedStatus.shutdown_data2 = d2;
+    sched_shutdown(reason);
+}
 
 /****************************************************************
  * Startup
