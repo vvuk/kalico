@@ -54,8 +54,9 @@ static const struct i2c_info i2c_bus[] = {
 static void
 i2c_us_delay(uint32_t us)
 {
-    uint32_t t = timer_read_time() + timer_from_us(us);
-    while(t > timer_read_time());
+    uint32_t timeout = timer_read_time() + timer_from_us(us);
+    while (timer_is_before(timer_read_time(), timeout))
+      ;
 }
 
 static void
@@ -72,17 +73,15 @@ i2c_init(I2C_TypeDef *i2c)
 // "2.9.7 I2C analog filter may provide wrong value, locking BUSY
 // flag and preventing master mode entry"
 static void
-i2c_busy_errata(I2C_TypeDef *i2c)
+i2c_stm32f1_busy_errata(I2C_TypeDef *i2c)
 {
     if (!CONFIG_MACH_STM32F1)
         return;
     
     const struct i2c_info *ii = container_of((I2C_TypeDef * const *)i2c, struct i2c_info, i2c);
-    uint32_t val;
-    (void)val;
-    val = i2c->SR1;
-    val = i2c->SR2;
-    val = i2c->DR;
+    i2c->SR1;
+    i2c->SR2;
+    i2c->DR;
     i2c->CR1 = 0;
     i2c->CR2 = 0;
     i2c->DR = 0;
@@ -128,7 +127,7 @@ i2c_setup(uint32_t bus, uint32_t rate, uint8_t addr)
     if (!is_enabled_pclock((uint32_t)i2c)) {
         // Enable i2c clock and gpio
         enable_pclock((uint32_t)i2c);
-        i2c_busy_errata(i2c);
+        i2c_stm32f1_busy_errata(i2c);
         gpio_peripheral(ii->scl_pin, GPIO_FUNCTION(4) | GPIO_OPEN_DRAIN, 1);
         gpio_peripheral(ii->sda_pin, GPIO_FUNCTION(4) | GPIO_OPEN_DRAIN, 1);
         i2c->CR1 = I2C_CR1_SWRST;
@@ -142,29 +141,51 @@ i2c_setup(uint32_t bus, uint32_t rate, uint8_t addr)
 }
 
 static int
-i2c_wait(I2C_TypeDef *i2c, uint32_t set, uint32_t clear, uint32_t timeout)
+i2c_wait_with_retry(I2C_TypeDef *i2c, uint32_t set, uint32_t clear, uint32_t timeout,
+                    uint8_t want_retry)
 {
+    uint8_t did_retry = want_retry ? 0 : 1;
+retry:
     for (;;) {
-        int ret = 0;
         uint32_t sr1 = i2c->SR1, sr2 = i2c->SR2;
 
         if ((sr1 & set) == set && (sr1 & clear) == 0)
             return I2C_BUS_SUCCESS;
 
         if (sr1 & I2C_SR1_AF)
-            ret |= (1 << I2C_BUS_NACK);
-        if (!timer_is_before(timer_read_time(), timeout))
-            ret |= (1 << I2C_BUS_TIMEOUT);
+            return I2C_BUS_NACK;
 
-        if (ret != 0) {
-            if (sr2 & I2C_SR2_BUSY)
-                ret |= (1 << I2C_BUS_BUSY);
-            if (sr1 & I2C_SR1_BERR)
-                ret |= (1 << I2C_BUS_ERR);
-            i2c_busy_errata(i2c);
-            return ret;
+        if (timer_is_before(timer_read_time(), timeout))
+            continue;
+
+        // At this point, we've hit the timeout. On non stm32f1,
+        // we're done, just return timeout.
+        if (!CONFIG_MACH_STM32F1)
+            return I2C_BUS_TIMEOUT;
+
+        // On stm32f1, we may need to reset the I2C lines.
+        // Check if the bus thinks it's busy. If so, reset
+        // the lines because we expect to be the only master.
+        if (sr2 & I2C_SR2_BUSY) {
+            if (!did_retry) {
+                i2c_stm32f1_busy_errata(i2c);
+                did_retry = 1;
+                goto retry;
+            }
+            return I2C_BUS_BUSY;
         }
+
+        if (sr1 & I2C_SR1_BERR)
+            return I2C_BUS_ERR;
+
+        return I2C_BUS_TIMEOUT;
     }
+}
+
+static int
+i2c_wait(I2C_TypeDef *i2c, uint32_t set, uint32_t clear, uint32_t timeout)
+{
+  return i2c_wait_with_retry(i2c, set, clear, timeout, 0);
 }
 
 static int
@@ -174,27 +195,17 @@ i2c_start(I2C_TypeDef *i2c, uint8_t addr, uint8_t xfer_len,
     int ret = 0;
     i2c->CR1 = I2C_CR1_START | I2C_CR1_PE;
 
-    ret = i2c_wait(i2c, I2C_SR1_SB, 0, timeout);
-    if (ret != I2C_BUS_SUCCESS) {
-        if (ret != I2C_BUS_BUSY)
-            return ret;
-
-        if (i2c_wait(i2c, I2C_SR1_SB, 0, timeout) != I2C_BUS_SUCCESS)
-            return I2C_BUS_BUSY;
-    }
+    ret = i2c_wait_with_retry(i2c, I2C_SR1_SB, 0, timeout, 1);
+    if (ret != I2C_BUS_SUCCESS)
+        return ret;
 
     i2c->DR = addr;
     if (addr & 0x01)
         i2c->CR1 |= I2C_CR1_ACK;
 
-    ret = i2c_wait(i2c, I2C_SR1_ADDR, 0, timeout);
-    if (ret != I2C_BUS_SUCCESS) {
-        if (ret != I2C_BUS_BUSY)
-            return ret;
-
-          if (i2c_wait(i2c, I2C_SR1_ADDR, 0, timeout) != I2C_BUS_SUCCESS)
-              return I2C_BUS_BUSY;
-    }
+    ret = i2c_wait_with_retry(i2c, I2C_SR1_ADDR, 0, timeout, 1);
+    if (ret != I2C_BUS_SUCCESS)
+        return ret;
 
     irqstatus_t flag = irq_save();
     uint32_t sr2 = i2c->SR2;
@@ -245,7 +256,9 @@ i2c_write(struct i2c_config config, uint8_t write_len, uint8_t *write)
     if (ret != I2C_BUS_SUCCESS)
         return ret;
     while (write_len--) {
-        ret |= i2c_send_byte(i2c, *write++, timeout);
+        ret = i2c_send_byte(i2c, *write++, timeout);
+        if (ret != I2C_BUS_SUCCESS)
+            break;
     }
     i2c_stop(i2c, timeout);
     return ret;
@@ -266,7 +279,9 @@ i2c_read(struct i2c_config config, uint8_t reg_len, uint8_t *reg
         if (ret != I2C_BUS_SUCCESS)
             return ret;
         while (reg_len--) {
-            ret |= i2c_send_byte(i2c, *reg++, timeout);
+            ret = i2c_send_byte(i2c, *reg++, timeout);
+            if (ret != I2C_BUS_SUCCESS)
+                break;
         }
         if (ret != I2C_BUS_SUCCESS)
             return ret;
