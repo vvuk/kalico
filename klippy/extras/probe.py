@@ -155,7 +155,7 @@ class PrinterProbe:
     def get_offsets(self):
         return self.x_offset, self.y_offset, self.z_offset
 
-    def _probe(self, speed):
+    def _probe(self, speed, will_drop=False):
         toolhead = self.printer.lookup_object("toolhead")
         curtime = self.printer.get_reactor().monotonic()
         if "z" not in toolhead.get_status(curtime)["homed_axes"]:
@@ -187,7 +187,7 @@ class PrinterProbe:
         # add z compensation to probe position
         epos[2] += z_compensation
         self.gcode.respond_info(
-            "probe at %.3f,%.3f is z=%.6f" % (epos[0], epos[1], epos[2])
+            "probe at %.3f,%.3f is z=%.6f%s" % (epos[0], epos[1], epos[2], " (dropped)" if will_drop else "")
         )
         return epos[:3]
 
@@ -237,6 +237,8 @@ class PrinterProbe:
 
         first_probe = True
         while len(positions) < sample_count:
+            if retries >= samples_retries:
+                raise gcmd.error("Probe retries exceeded samples_retries")
             # Probe position
             pos = self._probe(speed)
             if pos[2] == math.inf:
@@ -255,8 +257,6 @@ class PrinterProbe:
             # Check samples tolerance
             z_positions = [p[2] for p in positions]
             if max(z_positions) - min(z_positions) > samples_tolerance:
-                if retries >= samples_retries:
-                    raise gcmd.error("Probe samples exceed samples_tolerance")
                 gcmd.respond_info("Probe samples exceed tolerance. Retrying...")
                 retries += 1
                 positions = []
@@ -324,9 +324,12 @@ class PrinterProbe:
 
         first_probe = True
         while len(positions) < sample_count:
+            drop_result = self._drop_first_result and first_probe
             # Probe position
-            pos = self._probe(speed)
-            if self._drop_first_result and first_probe:
+            pos = self._probe(speed, will_drop=drop_result)
+            if pos[2] == math.inf:
+                raise gcmd.error("Probe failed")
+            if drop_result:
                 first_probe = False
                 liftpos = [None, None, pos[2] + sample_retract_dist]
                 self._move(liftpos, lift_speed)
