@@ -11,9 +11,6 @@ enum {
     I2C_BUS_TIMEOUT,
     I2C_BUS_START_NACK,
     I2C_BUS_START_READ_NACK,
-    I2C_BUS_BUSY,
-    I2C_BUS_START_BUSY,
-    I2C_BUS_ERR,
 };
 
 struct i2cdev_s {
