@@ -861,8 +861,16 @@ class MCU:
         if clock is not None:
             self._shutdown_clock = self.clock32_to_clock64(clock)
         d1, d2 = params.get("d1"), params.get("d2")
-        d1 = str.format("d1=0x%08x", d1) if d1 else None
-        d2 = str.format("d2=0x%08x", d2) if d2 else None
+        if d1:
+            signed = d1 - 0x100000000 if d1 >= 0x80000000 else d1
+            d1 = f"d1=0x{d1:08x}/{signed}/{d1}"
+        else:
+            d1 = None
+        if d2:
+            signed = d2 - 0x100000000 if d2 >= 0x80000000 else d2
+            d2 = f"d2=0x{d2:08x}/{signed}/{d2}"
+        else:
+            d2 = None
         self._shutdown_msg = msg = params["static_string_id"]
         if get_danger_options().log_shutdown_info:
             logging.info(
@@ -882,6 +890,7 @@ class MCU:
         append_msgs = []
         if d1 is not None or d2 is not None:
             append_msgs.append({"d1": d1, "d2": d2})
+            msg += " " + d1 + " " + d2
 
         if (
             msg.startswith("ADC out of range")

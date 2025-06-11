@@ -122,10 +122,11 @@ static uint32_t timer_repeat_until;
 static uint32_t
 timer_dispatch_many(void)
 {
+    void *func = 0;
     uint32_t tru = timer_repeat_until;
     for (;;) {
         // Run the next software timer
-        uint32_t next = sched_timer_dispatch();
+        uint32_t next = sched_timer_dispatch(&func);
 
         uint32_t now = timer_read_time();
         int32_t diff = next - now;
@@ -136,7 +137,7 @@ timer_dispatch_many(void)
         if (unlikely(timer_is_before(tru, now))) {
             // Check if there are too many repeat timers
             if (diff < (int32_t)(-timer_from_us(1000)))
-                try_shutdown("Rescheduled timer in the past");
+                try_shutdown_with_data("Rescheduled timer in the past", diff, func);
             if (sched_check_set_tasks_busy()) {
                 timer_repeat_until = now + TIMER_REPEAT_TICKS;
                 return TIMER_DEFER_REPEAT_TICKS;

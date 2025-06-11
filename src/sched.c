@@ -148,7 +148,7 @@ sched_del_timer(struct timer *del)
 
 // Invoke the next timer - called from board hardware irq code.
 unsigned int
-sched_timer_dispatch(void)
+sched_timer_dispatch(void** func)
 {
     // Invoke timer callback
     struct timer *t = SchedStatus.timer_list;
@@ -165,18 +165,22 @@ sched_timer_dispatch(void)
     // Update timer_list (rescheduling current timer if necessary)
     unsigned int next_waketime = updated_waketime;
     if (unlikely(res == SF_DONE)) {
+	*func = t->next->func;
         next_waketime = t->next->waketime;
         SchedStatus.timer_list = t->next;
         if (SchedStatus.last_insert == t)
             SchedStatus.last_insert = t->next;
     } else if (!timer_is_before(updated_waketime, t->next->waketime)) {
         next_waketime = t->next->waketime;
+	*func = t->next->func;
         SchedStatus.timer_list = t->next;
         struct timer *pos = SchedStatus.last_insert;
         if (timer_is_before(updated_waketime, pos->waketime))
             pos = SchedStatus.timer_list;
         insert_timer(pos, t, updated_waketime);
         SchedStatus.last_insert = t;
+    } else {
+        *func = t->func;
     }
 
     return next_waketime;
