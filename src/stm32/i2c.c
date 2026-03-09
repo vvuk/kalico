@@ -273,7 +273,6 @@ i2c_read(struct i2c_config config, uint8_t reg_len, uint8_t *reg
     I2C_TypeDef *i2c = config.i2c;
     uint32_t timeout = timer_read_time() + timer_from_us(5000);
     uint8_t addr = config.addr | 0x01;
-    int ret;
 
     if (reg_len) {
         // write the register
@@ -291,10 +290,12 @@ i2c_read(struct i2c_config config, uint8_t reg_len, uint8_t *reg
         ret = I2C_BUS_START_READ_NACK;
     if (ret != I2C_BUS_SUCCESS)
         goto abrt;
-    while(read_len--) {
-        *read = i2c_read_byte(i2c, timeout, read_len);
+    while (read_len-- && ret == I2C_BUS_SUCCESS) {
+        *read = i2c_read_byte(i2c, timeout, read_len, &ret);
         read++;
     }
+    if (ret != I2C_BUS_SUCCESS)
+        goto abrt;
     // covers read timeout
     return i2c_wait(i2c, 0, I2C_SR1_RXNE, timeout);
 abrt:
